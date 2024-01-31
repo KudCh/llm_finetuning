@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+# coding: utf-8
+
+from ernie import SentenceClassifier, Models
+from sklearn.preprocessing import LabelEncoder, LabelBinarizer
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score
+from time import time
+import pandas as pd
+import numpy as np
+import sys
+import csv
+import os
+
+
+def get_classifier(model_name, num_classes):
+    # Instantiate Ernie based on the given (str) model name.
+    # The number of classes depends on the task:
+    # Query scope (3 classes), Query purpose (6), Response format (4), Information feature (13).
+    return SentenceClassifier(
+        model_name=getattr(Models, model_name),
+        labels_no=num_classes
+    )
+
+
+def eval_classifier(classifier, X_test, y_test, num_classes):
+    # Parse Pandas DFs as native Python lists.
+    test_sentences = X_test['Query'].values.tolist()
+    test_labels = y_test.values.tolist()
+
+    # FIXME: Why do we need to iterate over ALL predictions?
+    probs = [p for p in classifier.predict(test_sentences)]
+    pred_labels = np.argmax(probs, axis=1)
+
+    # In some tasks the datasets are highly imbalanced,
+    # so better report balanced accuracy instead of plain accuracy.
+    acc = accuracy_score(test_labels, pred_labels)
+    bal = balanced_accuracy_score(test_labels, pred_labels)
+
+    # For AUC computation we need to one-hot encode the labels.
+    label_binarizer = LabelBinarizer()
+    label_binarizer.fit(range(num_classes))
+    b_true = label_binarizer.transform(test_labels)
+    b_pred = label_binarizer.transform(pred_labels)
+    # We consider the one-vs-all (aka one-vs-rest) case.
+    roc = roc_auc_score(b_true, b_pred, multi_class='ovr')
+
+    return (acc, bal, roc)
+
+
+# --- ENTRY POINT ---
+# We provide a model name and a target label to train/predict.
+model_name = sys.argv[1] # e.g. AlbertLargeCased2
+key = sys.argv[2] # e.g. 'Query Scope'
+
+# Create output dir.
+outdir_name = key.replace(' ', '')
+os.makedirs(outdir_name, exist_ok=True)
+
+# Create CSV writer.
+file_name = outdir_name + '/' + outdir_name + '_' + model_name + '.csv'
+csvfile = open(file_name, mode='w')
+result_writer = csv.writer(csvfile, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
+
+# Load dataset. We just need two columns:
+# the one with the sentences and the one with the target labels.
+df_original = pd.read_csv('codedQueries.csv', sep=',')
+df = df_original[['Query', key]]
+le = LabelEncoder() # sparse encoding
+df[[key]] = df[[key]].apply(le.fit_transform)
+# Some targets are empty, so remove those rows.
+df.dropna(inplace=True)
+
+# Ensure at least 5 observations per class, otherwise remove.
+value_counts = df[key].value_counts()
+to_remove = value_counts[value_counts <= 5].index
+df = df[~df[key].isin(to_remove)]
+
+y = df[key]
+num_classes = len(y.unique())
+print('Number of classes:', num_classes)
+
+# NB: `X_train` and `X_test` will have two columns: (1) sentences and (2) labels.
+X_train, X_test, y_train, y_test = train_test_split(df, y, test_size=0.2, random_state=42, stratify=y)
+
+classifier = get_classifier(model_name, num_classes)
+classifier.load_dataset(X_train, validation_split=0.1)
+
+# The very first row in the output CSV reports the results without finetuning (0 epochs).
+(acc, bal, roc) = eval_classifier(classifier, X_test, y_test, num_classes)
+result_writer.writerow(list(map(str, [model_name, 0, acc, bal, roc, 0.])))
+
+print('Test accuracy no finetuning ..........:', acc)
+print('Test balanced accuracy no finetuning .:', bal)
+print('Area under ROC no finetuning .........:', roc)
+
+# Finetune model for 20 epochs at most.
+for i in range(1, 21):
+    print(f'*** EPOCH {i} ***')
+
+    # Compute finetuning time, in seconds.
+    t_start = time()
+
+    # NB: The classifier will resume finetuning automatically.
+    # Therefore we set `epochs=1` instead of `epochs=i`.
+    # See https://github.com/labteral/ernie/blob/master/ernie/ernie.py for default args;
+    # e.g. `learning_rate=2e-5, training_batch_size=32, validation_batch_size=64`.
+    # For larger models like AlbertXXLargeCased2 we must use 8 sentences per batch,
+    # otherwise we may run out of memory.
+    classifier.fine_tune(epochs=1, training_batch_size=16, validation_batch_size=32)
+
+    t_end = time()
+    process_time = t_end - t_start
+
+    # NB: `classifier.dump()` will raise an error if the output file already exists.
+    # Therefore we add a timestamp to force a unique file/dir name.
+    now = int(time())
+    classifier.dump(f'{outdir_name}/{model_name}_ep{i}_{outdir_name}_{now}')
+    classifier.load_dataset(X_train, validation_split=0.1)
+
+    (acc, bal, roc) = eval_classifier(classifier, X_test, y_test, num_classes)
+    result_writer.writerow(list(map(str, [model_name, i, acc, bal, roc, process_time])))
+
+    print(f'Test accuracy after {i} epochs ..........:', acc)
+    print(f'Test balanced accuracy after {i} epochs .:', bal)
+    print(f'Area under ROC after {i} epochs .........:', roc)
+
+print('Done!')
